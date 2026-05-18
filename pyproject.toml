@@ -1,0 +1,16 @@
+[project]
+name = "quick-wholebrain-overview"
+version = "0.1.0"
+description = "Quick whole-brain calcium trace analysis for BlaC vs BlaC-Catalytically Dead comparison"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "zarr",
+    "zarrs",
+    "scipy",
+    "scikit-image",
+    "matplotlib",
+    "imageio[ffmpeg]",
+    "pandas",
+]
