@@ -1,10 +1,12 @@
 """
-Power analysis for BlaC vs BlaC-Cat.Dead post-bleach raw intensity.
+Power analysis for BlaC vs BlaC-Cat.Dead post-bleach raw mean intensity.
 
-Uses the preliminary (March) dataset to estimate effect size, then computes
-the sample size needed to detect that effect at various power levels using:
-  1. Analytic t-test power (closed form, for sanity check)
-  2. Simulation-based Mann-Whitney U power (matches the actual test used)
+Reads precomputed per-animal traces from the cache produced by
+analyze_calcium_traces_preliminarydata.py (the canonical analysis), then:
+  1. Computes the observed effect size (Cohen's d, Hedges' g).
+  2. Estimates n per group required to detect that effect at various powers
+     using analytic t-test power and simulation-based Mann-Whitney U power
+     (the test actually used in the analysis).
 """
 
 from pathlib import Path
@@ -14,30 +16,29 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import zarr
-from scipy.stats import median_abs_deviation, mannwhitneyu, norm, sem, t
+from scipy.stats import mannwhitneyu, norm, t
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-PREPROCESSED_DIR_PRELIMINARY = Path("/home/lauren/wholistic_preprocessing/preprocessed")
+# Per-animal trace cache written by analyze_calcium_traces_preliminarydata.py.
+# Each {animal}.npz contains `mean_trace` covering all frames; we slice
+# post-bleach here so this script stays decoupled from BLEACH_CUTOFF_FRAME
+# choices baked into the analyze run.
+CACHE_DIR = Path(
+    "/store1/lauren/Tetramisole_Immobilized_Imaging/"
+    "2026_cAMP_wholebrain_with_pdfr1_BlaC_Immobilized/PreliminaryData/cache"
+)
 OUTPUT_DIR = Path("/home/lauren/quick_wholebrain_overview/outputs/power_analysis")
 
-FRAME_RATE_HZ = 1.7
 BLEACH_CUTOFF_FRAME = 50
-CALCIUM_CHANNEL = 0
-THRESHOLD_FRAMES = 10
-THRESHOLD_K = 4
 
-PRELIMINARY_ANIMALS = [
-    {"name": "2026-03-03-01", "condition": "BlaC-Cat.Dead"},
-    {"name": "2026-03-03-02", "condition": "BlaC-Cat.Dead"},
-    {"name": "2026-03-03-03", "condition": "BlaC-Cat.Dead"},
-    {"name": "2026-03-03-05", "condition": "BlaC"},
-    {"name": "2026-03-04-02", "condition": "BlaC"},
-    {"name": "2026-03-04-03", "condition": "BlaC"},
-    {"name": "2026-03-04-04", "condition": "BlaC"},
-    {"name": "2026-03-04-05", "condition": "BlaC"},
-]
+# Condition mapping — must match analyze_calcium_traces_preliminarydata.py
+BLAC_CAT_DEAD_ALL = ["2026-03-03-01", "2026-03-03-02", "2026-03-03-03", "2026-03-03-04"]
+BLAC_ALL = ["2026-03-03-05", "2026-03-04-02", "2026-03-04-03", "2026-03-04-04", "2026-03-04-05"]
+EXCLUDE = ["2026-03-03-04"]   # wrong length timeseries
+
+BLAC_CAT_DEAD = [n for n in BLAC_CAT_DEAD_ALL if n not in EXCLUDE]
+BLAC = [n for n in BLAC_ALL if n not in EXCLUDE]
 
 # Power analysis settings
 ALPHA = 0.05
@@ -46,33 +47,17 @@ SAMPLE_SIZES = list(range(3, 31))   # n per group to scan
 N_SIMULATIONS = 5000                # bootstrap reps per (n, model)
 RNG_SEED = 42
 
-# ── Trace extraction (same logic as the main pipeline) ────────────────────────
+# ── Cache loader ──────────────────────────────────────────────────────────────
 
-def open_zarr(name, preprocessed_dir):
-    return zarr.open(str(preprocessed_dir / f"{name}.zarr"), mode="r")
-
-
-def compute_mip(arr, t_idx, channel):
-    return np.asarray(arr[t_idx, channel]).max(axis=0).astype(np.float32)
-
-
-def compute_threshold_mask(arr, channel, n_frames=10, k=4.0):
-    n = min(n_frames, arr.shape[0])
-    mip_sum = np.zeros((arr.shape[3], arr.shape[4]), dtype=np.float64)
-    for ti in range(n):
-        mip_sum += compute_mip(arr, ti, channel)
-    avg_mip = (mip_sum / n).astype(np.float32)
-    med = np.median(avg_mip)
-    mad = median_abs_deviation(avg_mip, axis=None)
-    return avg_mip > (med + k * mad)
-
-
-def extract_post_bleach_mean(arr, mask, channel, cutoff):
-    n_t = arr.shape[0]
-    trace = np.zeros(n_t, dtype=np.float64)
-    for ti in range(n_t):
-        trace[ti] = compute_mip(arr, ti, channel)[mask].mean()
-    return trace[cutoff:].mean()
+def load_post_bleach_mean(animal: str) -> float:
+    path = CACHE_DIR / f"{animal}.npz"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"No cache for {animal} at {path}. "
+            f"Run analyze_calcium_traces_preliminarydata.py first."
+        )
+    data = np.load(path)
+    return float(data["mean_trace"][BLEACH_CUTOFF_FRAME:].mean())
 
 
 # ── Effect-size helpers ───────────────────────────────────────────────────────
@@ -148,22 +133,24 @@ if __name__ == "__main__":
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(RNG_SEED)
 
-    # Step 1: extract post-bleach means from preliminary animals
+    # Step 1: load post-bleach means from cache
     print("=" * 60)
-    print("  Extracting post-bleach means from preliminary dataset")
+    print("  Loading post-bleach means from analyze cache")
     print("=" * 60)
+    print(f"  Cache dir: {CACHE_DIR}")
+    print(f"  Bleach cutoff frame: {BLEACH_CUTOFF_FRAME}")
 
     rows = []
-    for a in PRELIMINARY_ANIMALS:
-        print(f"  {a['name']} ({a['condition']})")
-        arr = open_zarr(a["name"], PRELIMINARY_DIR := PREPROCESSED_DIR_PRELIMINARY)
-        mask = compute_threshold_mask(arr, CALCIUM_CHANNEL,
-                                      THRESHOLD_FRAMES, THRESHOLD_K)
-        val = extract_post_bleach_mean(arr, mask, CALCIUM_CHANNEL,
-                                       BLEACH_CUTOFF_FRAME)
-        rows.append({"animal": a["name"], "condition": a["condition"],
+    for name in BLAC_CAT_DEAD:
+        val = load_post_bleach_mean(name)
+        rows.append({"animal": name, "condition": "BlaC-Cat.Dead",
                      "post_bleach_mean": val})
-        print(f"    post-bleach mean = {val:.2f}")
+        print(f"  {name} (BlaC-Cat.Dead): post-bleach mean = {val:.2f}")
+    for name in BLAC:
+        val = load_post_bleach_mean(name)
+        rows.append({"animal": name, "condition": "BlaC",
+                     "post_bleach_mean": val})
+        print(f"  {name} (BlaC):          post-bleach mean = {val:.2f}")
 
     df = pd.DataFrame(rows)
     df.to_csv(OUTPUT_DIR / "preliminary_post_bleach_means.csv", index=False)
